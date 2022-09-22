@@ -1,6 +1,7 @@
 """make variations of input image"""
 
 import argparse, os, sys, glob
+from mimetypes import init
 from random import sample
 import PIL
 import torch
@@ -21,12 +22,24 @@ from ldm.util import instantiate_from_config
 from ldm.models.diffusion.ddim import DDIMSampler
 from ldm.models.diffusion.plms import PLMSSampler
 from ldm.models.diffusion.ddpm import DDPM
+
+import torch.nn as nn
+import pytorch_lightning as pl
+from torch.optim.lr_scheduler import LambdaLR
+from contextlib import contextmanager
+from functools import partial
+from pytorch_lightning.utilities.distributed import rank_zero_only
+
+from ldm.util import log_txt_as_img, exists, default, ismap, isimage, mean_flat, count_params, instantiate_from_config
+from ldm.modules.ema import LitEma
+from ldm.modules.distributions.distributions import normal_kl, DiagonalGaussianDistribution
+from ldm.models.autoencoder import VQModelInterface, IdentityFirstStage, AutoencoderKL
 from ldm.modules.diffusionmodules.util import make_beta_schedule, extract_into_tensor, noise_like
 
 
 
 
-class DDPM(Object):
+class DDPM(pl.LightningModule):
     # classic DDPM with Gaussian diffusion, in image space
     def __init__(self,
                  timesteps=1000,
@@ -83,29 +96,29 @@ class DDPM(Object):
         self.register_buffer('sqrt_recip_alphas_cumprod', to_torch(np.sqrt(1. / alphas_cumprod)))
         self.register_buffer('sqrt_recipm1_alphas_cumprod', to_torch(np.sqrt(1. / alphas_cumprod - 1)))
 
-        # calculations for posterior q(x_{t-1} | x_t, x_0)
-        posterior_variance = (1 - self.v_posterior) * betas * (1. - alphas_cumprod_prev) / (
-                    1. - alphas_cumprod) + self.v_posterior * betas
-        # above: equal to 1. / (1. / (1. - alpha_cumprod_tm1) + alpha_t / beta_t)
-        self.register_buffer('posterior_variance', to_torch(posterior_variance))
-        # below: log calculation clipped because the posterior variance is 0 at the beginning of the diffusion chain
-        self.register_buffer('posterior_log_variance_clipped', to_torch(np.log(np.maximum(posterior_variance, 1e-20))))
-        self.register_buffer('posterior_mean_coef1', to_torch(
-            betas * np.sqrt(alphas_cumprod_prev) / (1. - alphas_cumprod)))
-        self.register_buffer('posterior_mean_coef2', to_torch(
-            (1. - alphas_cumprod_prev) * np.sqrt(alphas) / (1. - alphas_cumprod)))
+        # # calculations for posterior q(x_{t-1} | x_t, x_0)
+        # posterior_variance = (1 - self.v_posterior) * betas * (1. - alphas_cumprod_prev) / (
+        #             1. - alphas_cumprod) + self.v_posterior * betas
+        # # above: equal to 1. / (1. / (1. - alpha_cumprod_tm1) + alpha_t / beta_t)
+        # self.register_buffer('posterior_variance', to_torch(posterior_variance))
+        # # below: log calculation clipped because the posterior variance is 0 at the beginning of the diffusion chain
+        # self.register_buffer('posterior_log_variance_clipped', to_torch(np.log(np.maximum(posterior_variance, 1e-20))))
+        # self.register_buffer('posterior_mean_coef1', to_torch(
+        #     betas * np.sqrt(alphas_cumprod_prev) / (1. - alphas_cumprod)))
+        # self.register_buffer('posterior_mean_coef2', to_torch(
+        #     (1. - alphas_cumprod_prev) * np.sqrt(alphas) / (1. - alphas_cumprod)))
 
-        if self.parameterization == "eps":
-            lvlb_weights = self.betas ** 2 / (
-                        2 * self.posterior_variance * to_torch(alphas) * (1 - self.alphas_cumprod))
-        elif self.parameterization == "x0":
-            lvlb_weights = 0.5 * np.sqrt(torch.Tensor(alphas_cumprod)) / (2. * 1 - torch.Tensor(alphas_cumprod))
-        else:
-            raise NotImplementedError("mu not supported")
-        # TODO how to choose this term
-        lvlb_weights[0] = lvlb_weights[1]
-        self.register_buffer('lvlb_weights', lvlb_weights, persistent=False)
-        assert not torch.isnan(self.lvlb_weights).all()
+        # if self.parameterization == "eps":
+        #     lvlb_weights = self.betas ** 2 / (
+        #                 2 * self.posterior_variance * to_torch(alphas) * (1 - self.alphas_cumprod))
+        # elif self.parameterization == "x0":
+        #     lvlb_weights = 0.5 * np.sqrt(torch.Tensor(alphas_cumprod)) / (2. * 1 - torch.Tensor(alphas_cumprod))
+        # else:
+        #     raise NotImplementedError("mu not supported")
+        # # TODO how to choose this term
+        # lvlb_weights[0] = lvlb_weights[1]
+        # self.register_buffer('lvlb_weights', lvlb_weights, persistent=False)
+        # assert not torch.isnan(self.lvlb_weights).all()
 
     def q_mean_variance(self, x_start, t):
         """
@@ -255,7 +268,7 @@ def main():
     parser.add_argument(
         "--n_samples",
         type=int,
-        default=2,
+        default=1,
         help="how many samples to produce for each given prompt. A.k.a batch size",
     )
     parser.add_argument(
@@ -347,18 +360,34 @@ def main():
 
     assert os.path.isfile(opt.init_img)
     init_image = load_img(opt.init_img).to(device)
+    # init_image = init_image[0]
+
+    # cv2.imwrite('./init.png', init_image)
+    # init_image = torch.clamp((init_image + 1.0) / 2.0, min=0.0, max=1.0)
+    # init_image = 255. * rearrange(init_image.cpu().numpy(), 'c h w -> h w c')
+    # Image.fromarray(init_image.astype(np.uint8)).save('./init.png')
+
     init_image = repeat(init_image, '1 ... -> b ...', b=batch_size)
     init_latent = model.get_first_stage_encoding(model.encode_first_stage(init_image))  # move to latent space
-    print("init_latent:shape:{}".format(init_latent.size()))
+    # init_latent = torch.clamp((init_latent[0] + 1.0) / 2.0, min=0.0, max=1.0)
+    # init_latent = 255. * rearrange(init_latent.cpu().numpy(), 'c h w -> h w c')
+    # Image.fromarray(init_latent.astype(np.uint8)).save('./latent.png')
+    # cv2.imwrite('./init_latent.png', init_latent)
+    noise = torch.randn_like(init_latent).to(device)
+    init_latent = init_latent.to(device)
+    t = 900
+    t = repeat(torch.tensor([t]), '1 -> b', b=batch_size)
+    t = t.to(device).long()
+    x_noisy = sampler.q_sample(x_start=init_latent, t=t, noise=noise)
+    print("x_noisy:shape:{}".format(x_noisy.size()))
+    print("x_noisy:{}".format(x_noisy))
 
-    # sampler.make_schedule(ddim_num_steps=opt.ddim_steps, ddim_eta=opt.ddim_eta, verbose=False)
-
-    # mean, variance, _ = sampler.q_mean_variance(init_latent, 300)
-    noise = torch.randn_like(init_latent)
-    x_noisy = sampler.q_sample(x_start=init_latent, t=300, noise=noise)
-    x_noisy = x_noisy.permute(0, 2, 3, 1).squeeze().cpu().numpy()
-    x_noisy = np.clip(x_noisy, 0, 255)
-    cv2.imwrite('./test.png', x_noisy)
+    x_noisy = torch.clamp((x_noisy[0] + 1.0) / 2.0, min=0.0, max=1.0)
+    x_noisy = 255. * rearrange(x_noisy.cpu().numpy(), 'c h w -> h w c')
+    Image.fromarray(x_noisy.astype(np.uint8)).save('./x_noisy_t900.png')
+    # x_noisy = x_noisy.permute(0, 2, 3, 1).squeeze().cpu().numpy()
+    # x_noisy = np.clip(x_noisy, 0, 255)
+    # cv2.imwrite('./test.png', x_noisy)
     assert 0 
     assert 0. <= opt.strength <= 1., 'can only work with strength in [0.0, 1.0]'
     t_enc = int(opt.strength * opt.ddim_steps)
